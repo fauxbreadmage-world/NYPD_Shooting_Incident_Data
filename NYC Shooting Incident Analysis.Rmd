@@ -1,0 +1,158 @@
+---
+title: "NYC Shooting Incident Analysis"
+author: "NA"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(leaflet)
+library(leaflet.extras)
+library(sf)
+library(webshot)
+```
+
+## The Data
+
+This data is a list of every shooting incident that occurred in NYC from 2006 through the end of the previous calendar year. This dataset is intended for public use and allows for the public to explore the nature of the shooting incidents.
+
+This report is a look at the shooting incidents broken down and explored by each borough in NYC. Included is view of total incidents by borough, an examination of incidents over time by borough, and finally a heatmap identifying the physical locations of incidents.
+
+### Step 1. Load the data
+
+Besides the csv file that includes the data the geospatial data will be required for the heatmap.
+
+```{r, loading}
+# Load the dataset
+data_url <- 'https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD'
+data <- read.csv(data_url, stringsAsFactors = FALSE)
+
+# Load geospatial data
+boroughs <- st_read("https://data.cityofnewyork.us/api/geospatial/tqmj-j8zm?method=export&format=GeoJSON")
+```
+
+### Step 2. Data cleaning and transformation
+
+This step involves checking the data and changing the type where necessary.
+
+Here **OCCUR_DATE** is changed to a Date type.
+
+Additionally rows with missing data are removed. Because the relatively low number of 'NAs' in the data that this report is concerned with then removing them is the simplest solution with a low impact.
+
+Finally the centroid calculation is done for he boroughs, this is simply to allow for the naming on the heatmap later.
+
+```{r, inspecting, warning=FALSE}
+# Inspect the first few rows
+head(data)
+str(data)
+
+# Convert OCCUR_DATE to Date type
+data$OCCUR_DATE <- as.Date(data$OCCUR_DATE, format="%m/%d/%Y")
+
+# Extract Year-Month from OCCUR_DATE
+data$YearMonth <- format(data$OCCUR_DATE, "%Y-%m")
+
+#Remove NA
+data <- data[!is.na(data$Latitude) & !is.na(data$Longitude), ]
+
+#Calculate the Centroid of Each Borough
+boroughs_centroids <- st_centroid(boroughs)
+```
+
+### Step 3. Visualization and Analysis
+
+The first visual is a bar chart that provides a clear representation of the total number of incidents in each borough. From the chart, we can observe which boroughs have the highest and lowest number of incidents.
+
+```{r, fig.width=10, fig.height=6, echo=FALSE}
+# Summarize data by borough
+borough_counts <- data %>% 
+  group_by(BORO) %>% 
+  summarise(n = n())
+
+# Plotting the counts by borough
+ggplot(borough_counts, aes(x = BORO, y = n)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Number of Incidents by Borough", x = "Borough", y = "Number of Incidents") +
+  theme_minimal()
+```
+
+Similar to the first visual the next shows the number of incidents in each borough, but in this case it is broken down by time allowing us to see the trends through time.
+
+```{r, fig.width=10, fig.height=6, echo=FALSE}
+
+# Aggregate data by YearMonth and BORO
+incidents_by_time <- data %>%
+  group_by(YearMonth, BORO) %>%
+  summarise(n = n())
+
+# Convert YearMonth to Date type for plotting
+incidents_by_time$Date <- as.Date(paste0(incidents_by_time$YearMonth, "-01"))
+
+# Plotting the count by time in each borough with explicit date breaks
+ggplot(incidents_by_time, aes(x = Date, y = n, color = BORO)) +
+  geom_line() +
+  labs(title = "Trend of Incidents by Borough Over Time", x = "Time", y = "Number of Incidents") +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y")
+```
+
+Next is a linear regression model using one-hot encoding. This data represents a time series of incidents recorded over a period of time (2006-2022). Each observation corresponds to a specific month and year.
+
+```{r}
+# One-hot encoding for boroughs on the aggregated data
+incidents_by_time_encoded <- model.matrix(~ BORO - 1, data = incidents_by_time)
+
+# Create a numeric representation of time for regression on the aggregated data
+incidents_by_time$TimeNumeric <- as.numeric(incidents_by_time$Date)
+
+# Linear regression
+lm_result_time <- lm(n ~ TimeNumeric + ., data = cbind(incidents_by_time, incidents_by_time_encoded))
+summary(lm_result_time)
+```
+
+These results show the number of incidents varies significantly in certain months compared to the reference month.
+There's a general trend suggesting incidents decrease as time progresses, but this trend isn't strong enough to be deemed statistically significant.
+
+This final visualization is a heatmap displaying the location of all incidents. This provides an interesting insight with location context for the data.
+
+```{r, echo=FALSE}
+# Create a heatmap using the leaflet package
+m <- leaflet(data) %>%
+  addTiles() %>%
+  addHeatmap(lng = ~Longitude, lat = ~Latitude, intensity = ~1, radius = 10, blur = 15, max = 0.05, gradient = c("0" = 'green', "0.5" = 'yellow', "1" = 'red')) %>%
+  addPolygons(data = boroughs, color = "#000000", weight = 2, smoothFactor = 0.3, fillOpacity = 0) %>%
+  addLabelOnlyMarkers(data = boroughs_centroids, label = ~boro_name, labelOptions = labelOptions(noHide = TRUE, direction = 'center', textOnly = TRUE, offset=c(0,0)))
+
+m
+
+# Save the map as an HTML widget
+htmlwidgets::saveWidget(m, "map.html", selfcontained = FALSE)
+
+# Capture a screenshot of the map
+webshot("map.html", file = "map.png", delay = 5)
+```
+
+
+```{r, echo=FALSE, fig.cap="Heatmap of Shooting Incidents in NYC"}
+knitr::include_graphics("map.png")
+```
+
+### Issues with the report
+
+First, the information provided is only a count of incidents. This means that while one borough may appear to be more likely to have an incident without some more context it is hard to say for sure. One better way to examine the data would be with incidents per capita. 
+
+Next, it appears that the number of incidents occuring in NYC has been steadily going down since 2006 only to jump back to much higher counts in 2020 and only going back down slowly. There is no way to know what might have caused this given the data available. Perhaps it has to do with global events or local policies. Only conjectures can be made without further information. This would be an easy place to let personal bias creep into the report.
+
+Finally, because of the way the heatmap works the best way to view this is as an html file. The pdf file only provides a screenshot of the heatmap data.
+
+```{r session info}
+sessionInfo()
+```
