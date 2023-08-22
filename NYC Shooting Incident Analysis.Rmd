@@ -3,10 +3,21 @@ title: "NYC Shooting Incident Analysis"
 author: "NA"
 date: "`r Sys.Date()`"
 output:
-  pdf_document: default
   html_document: default
+  pdf_document: default
 always_allow_html: true
 ---
+
+```{css, echo=FALSE}
+body {
+  background-color: #f5f5f5;  /* This is a light gray color. */
+}
+
+```
+
+### Load the necessary libraries
+
+This report uses quite a few, so make sure you have them installed before running!
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
@@ -16,18 +27,22 @@ library(dplyr)
 library(leaflet)
 library(leaflet.extras)
 library(sf)
-library(webshot)
+library(jsonlite)
+library(lubridate)
+library(caret)
 ```
 
 ## The Data
 
-This data is a list of every shooting incident that occurred in NYC from 2006 through the end of the previous calendar year. This dataset is intended for public use and allows for the public to explore the nature of the shooting incidents.
+This data is a list of every shooting incident that occurred in NYC from 2006 through the end of 2022. This dataset is intended for public use and allows for the public to explore the nature of the shooting incidents.
 
-This report is a look at the shooting incidents broken down and explored by each borough in NYC. Included is view of total incidents by borough, an examination of incidents over time by borough, and finally a heatmap identifying the physical locations of incidents.
+This report is a look at the shooting incidents broken down and explored by each borough in NYC. Included is view of total incidents by borough, an examination of incidents over time by borough, and includes a heatmap identifying the physical locations of incidents.
+
+The goal is to find out which borough has the most shooting incidents and which of the boroughs might be the "most dangerous."
 
 ### Step 1. Load the data
 
-Besides the csv file that includes the data the geospatial data will be required for the heatmap.
+Besides the csv file that includes the data, both the geospatial data and population data will be required.
 
 ```{r, loading}
 # Load the dataset
@@ -36,6 +51,9 @@ data <- read.csv(data_url, stringsAsFactors = FALSE)
 
 # Load geospatial data
 boroughs <- st_read("https://data.cityofnewyork.us/api/geospatial/tqmj-j8zm?method=export&format=GeoJSON")
+
+# Load population data from the provided JSON link
+population_data <- fromJSON("https://data.cityofnewyork.us/resource/xywu-7bv9.json")
 ```
 
 ### Step 2. Data cleaning and transformation
@@ -62,6 +80,12 @@ data$YearMonth <- format(data$OCCUR_DATE, "%Y-%m")
 #Remove NA
 data <- data[!is.na(data$Latitude) & !is.na(data$Longitude), ]
 
+#Clean the population data
+population_data <- population_data %>%
+  mutate(BORO = toupper(trimws(borough))) %>%
+  select(BORO)%>%
+  mutate(Population_2020 = as.numeric(population_data$`_2020`))
+
 #Calculate the Centroid of Each Borough
 boroughs_centroids <- st_centroid(boroughs)
 ```
@@ -82,6 +106,10 @@ ggplot(borough_counts, aes(x = BORO, y = n)) +
   labs(title = "Number of Incidents by Borough", x = "Borough", y = "Number of Incidents") +
   theme_minimal()
 ```
+
+This chart shows that Brooklyn has the most shooting incidents. Does this mean that it is the *"most dangerous"* of the boroughs?
+
+Lets continue to look at the data!
 
 Similar to the first visual the next shows the number of incidents in each borough, but in this case it is broken down by time allowing us to see the trends through time.
 
@@ -104,55 +132,179 @@ ggplot(incidents_by_time, aes(x = Date, y = n, color = BORO)) +
   scale_x_date(date_breaks = "1 year", date_labels = "%Y")
 ```
 
-Next is a linear regression model using one-hot encoding. This data represents a time series of incidents recorded over a period of time (2006-2022). Each observation corresponds to a specific month and year.
+Clearly Brooklyn lead the pack in the sheer number of shooting incidents! Looks like a good candidate for *most dangerous*.
 
-```{r}
-# One-hot encoding for boroughs on the aggregated data
-incidents_by_time_encoded <- model.matrix(~ BORO - 1, data = incidents_by_time)
+Lets take a look at the distribution of incidents across the boroughs using a heatmap!
 
-# Create a numeric representation of time for regression on the aggregated data
-incidents_by_time$TimeNumeric <- as.numeric(incidents_by_time$Date)
-
-# Linear regression
-lm_result_time <- lm(n ~ TimeNumeric + ., data = cbind(incidents_by_time, incidents_by_time_encoded))
-summary(lm_result_time)
-```
-
-These results show the number of incidents varies significantly in certain months compared to the reference month.
-There's a general trend suggesting incidents decrease as time progresses, but this trend isn't strong enough to be deemed statistically significant.
-
-This final visualization is a heatmap displaying the location of all incidents. This provides an interesting insight with location context for the data.
-
-```{r, echo=FALSE}
+```{r, fig.width=10, fig.height=6, echo=FALSE}
 # Create a heatmap using the leaflet package
-m <- leaflet(data) %>%
+leaflet(data) %>%
   addTiles() %>%
   addHeatmap(lng = ~Longitude, lat = ~Latitude, intensity = ~1, radius = 10, blur = 15, max = 0.05, gradient = c("0" = 'green', "0.5" = 'yellow', "1" = 'red')) %>%
   addPolygons(data = boroughs, color = "#000000", weight = 2, smoothFactor = 0.3, fillOpacity = 0) %>%
-  addLabelOnlyMarkers(data = boroughs_centroids, label = ~boro_name, labelOptions = labelOptions(noHide = TRUE, direction = 'center', textOnly = TRUE, offset=c(0,0)))
-
-m
-
-# Save the map as an HTML widget
-htmlwidgets::saveWidget(m, "map.html", selfcontained = FALSE)
-
-# Capture a screenshot of the map
-webshot("map.html", file = "map.png", delay = 5)
+  addLabelOnlyMarkers(data = boroughs_centroids, label = ~boro_name, labelOptions = labelOptions(noHide = TRUE, direction = 'auto', style = list("font-weight" = "bold", "color" = "black"), offset=c(0,0)))
 ```
 
+Hmmm this introduces a little doubt about the previous conclusion. We should investigate the number of incidents relative to the population! Good thing we brought that population data with us!
 
-```{r, echo=FALSE, fig.cap="Heatmap of Shooting Incidents in NYC"}
-knitr::include_graphics("map.png")
+```{r, fig.width=10, fig.height=6, echo=FALSE}
+# Merge the datasets
+merged_data <- data %>%
+  group_by(BORO) %>%
+  summarise(incident_count = n()) %>%
+  left_join(population_data, by = "BORO") %>%
+  mutate(incidents_per_100k = incident_count*100000/ Population_2020) %>%
+  select(c(BORO, incident_count, incidents_per_100k, Population_2020))
+
+# Ensure the borough names match between the datasets
+boroughs$boro_name <- toupper(boroughs$boro_name)
+merged_data_geo <- merge(boroughs, merged_data, by.x = "boro_name", by.y = "BORO")
+merged_data_geo$lng <- st_coordinates(st_centroid(merged_data_geo$geometry))[, "X"]
+merged_data_geo$lat <- st_coordinates(st_centroid(merged_data_geo$geometry))[, "Y"]
+
+# Define the color palette
+color_pal <- colorNumeric(palette = "YlOrRd", domain = merged_data_geo$incidents_per_100k)
+
+# Create the heatmap that includes the incidents per 100k
+leaflet(merged_data_geo) %>%
+  addTiles() %>%
+  addPolygons(fillColor = ~color_pal(incidents_per_100k), color = "#444444", weight = 2, smoothFactor = 0.3, opacity = 1,fillOpacity = 0.7,highlight = highlightOptions(color = "white", weight = 2,bringToFront = TRUE),label = ~paste(boro_name, ": ", round(incidents_per_100k, 2), " incidents per 100k"), labelOptions = labelOptions(style = list("font-weight" = "bold"),direction = "auto")) %>%
+  addLegend( pal = color_pal, values = ~incidents_per_100k, position = "bottomright", title = "Incidents per 100k")
 ```
+
+When the number of incidents is normalized by population the picture is quite a bit different. Suddenly the Bronx becomes the *most dangerous*. 
+
+Just for fun lets see if can use some model to predict incidents based on borough.
+
+```{r, fig.width=10, fig.height=6, echo=FALSE}
+df <- read.csv(data_url, stringsAsFactors = FALSE)
+
+#  Convert the 'OCCUR_DATE' column to Date type
+df$OCCUR_DATE <- as.Date(df$OCCUR_DATE, format="%m/%d/%Y")
+
+# Check for any NA values in the OCCUR_DATE column after conversion
+na_dates <- sum(is.na(df$OCCUR_DATE))
+
+# If there are NA values, print the unique problematic date formats
+if (na_dates > 0) {
+  problematic_dates <- unique(df$OCCUR_DATE[is.na(df$OCCUR_DATE)])
+  print(problematic_dates)
+} else {
+  # Filter the data for years 2006 to 2022
+  df <- df %>% filter(year(OCCUR_DATE) >= 2006 & year(OCCUR_DATE) <= 2022)
+}
+
+# Create a sequence of dates from 2006 to 2022
+all_dates <- seq(as.Date("2006-01-01"), as.Date("2022-12-31"), by="day")
+
+# Count incidents for each borough and date
+incident_counts <- df %>% 
+  group_by(OCCUR_DATE, BORO) %>% 
+  summarise(count = n()) %>% 
+  ungroup()
+
+# Create a dataframe with all combinations of dates and boroughs
+all_combinations <- expand.grid(OCCUR_DATE = all_dates, BORO = unique(df$BORO))
+
+# Merge the incident counts with all combinations
+final_df <- left_join(all_combinations, incident_counts, by = c("OCCUR_DATE", "BORO"))
+
+# Replace NA values with 0
+final_df$count[is.na(final_df$count)] <- 0
+
+# Spread the data to have boroughs as columns
+final_df <- final_df %>% spread(key = BORO, value = count)
+
+# Convert the counts to binary (1 if an incident occurred, 0 otherwise)
+boroughs <- names(final_df)[-1]  # Exclude the 'OCCUR_DATE' column
+for (borough in boroughs) {
+  final_df[[borough]] <- ifelse(final_df[[borough]] > 0, 1, 0)
+}
+
+# Convert the borough columns to a single categorical column
+final_df <- final_df %>% gather(key = "BORO", value = "incident_occurred", -OCCUR_DATE)
+
+# Split data into training and test sets
+set.seed(123)
+splitIndex <- createDataPartition(final_df$incident_occurred, p = .7, list = FALSE)
+train_data <- final_df[splitIndex,]
+test_data <- final_df[-splitIndex,]
+
+# Train a logistic regression model
+model <- glm(incident_occurred ~ BORO, data=train_data, family=binomial)
+summary(model)
+```
+
+Looking at this summary it would seem that the likelihood of an incident occurring is highly influenced by which borough you are in. This isn't all that surprising given the data and visuals we have seen so far. Using the Bronx as our intercept (and not normalizing with population) incidents are more likely to occur in Brooklyn and less likely to occur in the other boroughs. Which we have seen to be the case in the raw data. 
+
+Lets use a confusion matrix to look at the accuracy of our model in predicting incidents.
+
+```{r, fig.width=10, fig.height=6, echo=FALSE}
+# Predict on test data
+predictions <- predict(model, newdata=test_data, type="response")
+predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+
+# Evaluate the model
+confusionMatrix(as.factor(predicted_classes), as.factor(test_data$incident_occurred))
+```
+
+Here accuracy it looks like our accuracy (or percentage of time our model was correct) is 69.35%. So, decidedly average (Like most of my grades).
+
+It also looks like the model was better at predicting when an incident would occur **(Sensitivity)** than predicting when an incident would not occur **(Specificity)**.
+
+To help understand we can look at a couple visualizations.
+
+First this heatmap shows how well the model did. Predicted - 0 and Actual - 0 means the model predicted an incident didn't occur and an incident did not occur while Predicted - 1 and Actual - 1 means the model predicted an incident did occur and an incident actually occurred.
+
+```{r, fig.width=10, fig.height=6, echo=FALSE}
+# Create a dataframe from the confusion matrix
+cm <- confusionMatrix(as.factor(predicted_classes), as.factor(test_data$incident_occurred))
+confusion_matrix <- as.matrix(cm$table)
+confusion_df <- as.data.frame(as.table(confusion_matrix))
+
+# Rename the columns for clarity
+colnames(confusion_df) <- c("Actual", "Predicted", "Frequency")
+
+# Plot the heatmap for the confusion matrix
+heatmap_plot <- ggplot(confusion_df, aes(x=Actual, y=Predicted)) +
+  geom_tile(aes(fill=Frequency), color="white") +
+  geom_text(aes(label=sprintf("%d", Frequency)), vjust=1) +
+  scale_fill_gradient(low="white", high="blue") +
+  theme_minimal() +
+  labs(title="Confusion Matrix Heatmap", x="Actual", y="Predicted", fill="Frequency")
+
+print(heatmap_plot)
+```
+
+The bar chart is a break down of the indicators mentioned earlier.
+
+```{r, fig.width=10, fig.height=6, echo=FALSE}
+# Create a dataframe for the key metrics
+metrics <- data.frame(
+  Metric = c("Accuracy", "Sensitivity", "Specificity"),
+  Value = c(cm$overall["Accuracy"], cm$byClass["Sensitivity"], cm$byClass["Specificity"])
+)
+
+# Plot the bar plot for the key metrics
+bar_plot <- ggplot(metrics, aes(x=Metric, y=Value, fill=Metric)) +
+  geom_bar(stat="identity") +
+  geom_text(aes(label=sprintf("%.2f", Value)), vjust=-0.5) +
+  theme_minimal() +
+  labs(title="Model Metrics", x="", y="Value", fill="Metric") +
+  ylim(0, 1)
+
+print(bar_plot)
+```
+
+Overall the model performs ok, but has a lot of room for improvement.
 
 ### Issues with the report
 
-First, the information provided is only a count of incidents. This means that while one borough may appear to be more likely to have an incident without some more context it is hard to say for sure. One better way to examine the data would be with incidents per capita. 
+1. The initial data provided is only a count of incidents. This means that while one borough may appear to be more likely to have an incident without some more context it is hard to say for sure. It is better to examine the normalized data using population. 
 
-Next, it appears that the number of incidents occuring in NYC has been steadily going down since 2006 only to jump back to much higher counts in 2020 and only going back down slowly. There is no way to know what might have caused this given the data available. Perhaps it has to do with global events or local policies. Only conjectures can be made without further information. This would be an easy place to let personal bias creep into the report.
+2. The term **most dangerous** is a bit disingenuous. While the number of shooting incidents per 100k might be a good starting point for looking at danger its *still* missing context. A shooting incident could include accidental discharges or be self-inflicted for example. Additionally, there are many other factors to consider such as overall crime and total violent crimes. This is all to say we have an ethical duty to be careful how we communicate conclusions. 
 
-Finally, because of the way the heatmap works the best way to view this is as an html file. The pdf file only provides a screenshot of the heatmap data.
-
+3. it appears that the number of incidents occurring in NYC has been steadily going down since 2006 only to jump back to much higher counts in 2020 and only going back down slowly. There is no way to know what might have caused this given the data available. Perhaps it has to do with global events or local policies. Only conjectures can be made without further information. This would be an easy place to let personal bias creep into the report.
 ```{r session info}
 sessionInfo()
 ```
